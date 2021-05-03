@@ -1,5 +1,4 @@
-shape_predictor_68_face_landmarks.dat
 *.mp4
-input/
-output/
+payload/input/
+payload/output/
 *.pyc
