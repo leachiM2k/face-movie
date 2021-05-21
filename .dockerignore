@@ -1,0 +1,5 @@
+.*
+*.mp4
+payload/input/
+payload/output/
+*.pyc
