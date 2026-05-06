@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Face-Movie</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --bg-2: #1e293b;
+    --fg: #f8fafc;
+    --muted: #94a3b8;
+    --line: #334155;
+    --accent: #fb923c;
+    --accent-fg: #0f172a;
+    --error: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px 80px;
+  }
+  .wrap { width: 100%; max-width: 640px; }
+  header { text-align: center; margin-bottom: 32px; }
+  h1 { margin: 0 0 8px; font-size: 32px; font-weight: 800; letter-spacing: -0.02em; }
+  .tagline { color: var(--muted); margin: 0; font-size: 15px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .dropzone {
+    border: 2px dashed var(--line);
+    border-radius: 12px;
+    padding: 56px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    background: var(--bg-2);
+  }
+  .dropzone.dragover, .dropzone:hover {
+    border-color: var(--accent);
+    background: rgba(251, 146, 60, 0.05);
+  }
+  .dropzone strong { font-size: 16px; }
+  .dropzone .small {
+    color: var(--muted);
+    margin-top: 8px;
+    font-size: 13px;
+  }
+  .dropzone .picked {
+    color: var(--accent);
+    margin-top: 12px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .controls {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px 18px;
+    margin: 24px 0;
+  }
+  .control { display: flex; flex-direction: column; gap: 4px; }
+  .control label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .control input[type=number] {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--fg);
+    border-radius: 8px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .control input[type=number]:focus { outline: 2px solid var(--accent); outline-offset: -2px; border-color: var(--accent); }
+  .control.checkbox { flex-direction: row; align-items: center; gap: 8px; grid-column: 1 / -1; }
+  .control.checkbox input { width: 18px; height: 18px; accent-color: var(--accent); }
+  .control.checkbox label { text-transform: none; letter-spacing: normal; color: var(--fg); font-size: 14px; }
+
+  button.primary {
+    width: 100%;
+    padding: 14px 24px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.05s;
+  }
+  button.primary:hover:not(:disabled) { opacity: 0.92; }
+  button.primary:active:not(:disabled) { transform: translateY(1px); }
+  button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .progress { margin-top: 24px; padding: 16px; background: var(--bg-2); border-radius: 10px; }
+  .progress .row { margin-bottom: 12px; }
+  .progress .row:last-child { margin-bottom: 0; }
+  .progress .label { font-size: 13px; color: var(--muted); margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .progress .label .count { color: var(--fg); font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--accent); transition: width 0.2s; width: 0%; }
+
+  .result { margin-top: 24px; padding: 16px; background: var(--bg-2); border-radius: 10px; }
+  .result video { width: 100%; border-radius: 6px; display: block; }
+  .result .meta { color: var(--muted); font-size: 13px; margin: 12px 0 0; display: flex; justify-content: space-between; align-items: center; }
+  .result .download {
+    display: inline-block;
+    padding: 8px 16px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .result .download:hover { text-decoration: none; opacity: 0.92; }
+
+  .error { color: var(--error); font-size: 14px; margin-top: 16px; padding: 12px; background: rgba(248, 113, 113, 0.1); border-radius: 8px; border: 1px solid rgba(248, 113, 113, 0.3); }
+
+  footer { color: var(--muted); font-size: 12px; margin-top: 48px; text-align: center; }
+
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Face-Movie</h1>
+    <p class="tagline">Drop your selfies. Watch yourself age in 30 seconds.</p>
+  </header>
+
+  <div class="dropzone" id="drop">
+    <div><strong>Drop photos or a folder here</strong></div>
+    <div class="small">
+      or
+      <a href="#" id="pickFiles">choose files</a>
+      ·
+      <a href="#" id="pickFolder">choose folder</a>
+    </div>
+    <div class="picked" id="pickedCount"></div>
+  </div>
+
+  <input type="file" id="filesInput" multiple accept="image/jpeg,image/png" hidden />
+  <input type="file" id="folderInput" webkitdirectory hidden />
+
+  <div class="controls">
+    <div class="control">
+      <label for="scale">Scale (0.1 – 1.0)</label>
+      <input type="number" id="scale" value="1.0" min="0.1" max="1.0" step="0.1" />
+    </div>
+    <div class="control">
+      <label for="fpp">Frames per transition</label>
+      <input type="number" id="fpp" value="6" min="1" max="60" step="1" />
+    </div>
+    <div class="control">
+      <label for="fps">Output FPS</label>
+      <input type="number" id="fps" value="30" min="10" max="60" step="1" />
+    </div>
+    <div class="control">
+      <!-- spacer to keep grid aligned -->
+    </div>
+    <div class="control checkbox">
+      <input type="checkbox" id="overlay" checked />
+      <label for="overlay">Burn the filename into each frame</label>
+    </div>
+  </div>
+
+  <button class="primary" id="render" disabled>Render</button>
+
+  <div class="progress" id="progress" hidden>
+    <div class="row">
+      <div class="label">
+        <span id="stageLabel">Starting…</span>
+        <span class="count" id="stageCount"></span>
+      </div>
+      <div class="bar"><div class="fill" id="fill"></div></div>
+    </div>
+  </div>
+
+  <div class="error" id="errorBox" hidden></div>
+
+  <div class="result" id="result" hidden>
+    <video id="video" controls autoplay loop></video>
+    <div class="meta">
+      <span id="resultMeta"></span>
+      <a id="downloadLink" class="download" download="face-movie.mp4">Download MP4</a>
+    </div>
+  </div>
+
+  <footer>
+    Local Docker container. Photos never leave your machine.
+    See <a href="https://github.com/leachiM2k/face-movie">github.com/leachiM2k/face-movie</a> for the CLI.
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const drop = $("drop");
+const filesInput = $("filesInput");
+const folderInput = $("folderInput");
+const renderBtn = $("render");
+const pickedCount = $("pickedCount");
+const progress = $("progress");
+const stageLabel = $("stageLabel");
+const stageCount = $("stageCount");
+const fill = $("fill");
+const errorBox = $("errorBox");
+const result = $("result");
+const video = $("video");
+const downloadLink = $("downloadLink");
+const resultMeta = $("resultMeta");
+
+let selected = [];
+let activeJob = null;
+
+const IMG_RE = /\.(jpe?g|png)$/i;
+
+$("pickFiles").addEventListener("click", (e) => { e.preventDefault(); filesInput.click(); });
+$("pickFolder").addEventListener("click", (e) => { e.preventDefault(); folderInput.click(); });
+filesInput.addEventListener("change", () => setFiles([...filesInput.files]));
+folderInput.addEventListener("change", () => setFiles([...folderInput.files]));
+
+drop.addEventListener("click", (e) => {
+  // Click anywhere in the dropzone (except the inner links) opens the file picker.
+  if (e.target.tagName !== "A") filesInput.click();
+});
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("dragover"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
+drop.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  drop.classList.remove("dragover");
+  const items = [...e.dataTransfer.items];
+  const collected = [];
+  await Promise.all(items.map(async (item) => {
+    if (item.kind !== "file") return;
+    const entry = item.webkitGetAsEntry?.();
+    if (entry?.isDirectory) {
+      await traverseDir(entry, collected);
+    } else {
+      const f = item.getAsFile();
+      if (f) collected.push(f);
+    }
+  }));
+  setFiles(collected);
+});
+
+async function traverseDir(dirEntry, out) {
+  const reader = dirEntry.createReader();
+  const readBatch = () => new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+  while (true) {
+    const entries = await readBatch();
+    if (!entries.length) return;
+    for (const e of entries) {
+      if (e.isFile) {
+        await new Promise((resolve) => e.file((f) => { out.push(f); resolve(); }));
+      } else if (e.isDirectory) {
+        await traverseDir(e, out);
+      }
+    }
+  }
+}
+
+function setFiles(arr) {
+  selected = arr.filter((f) => IMG_RE.test(f.name));
+  if (!selected.length) {
+    pickedCount.textContent = "no images selected";
+    renderBtn.disabled = true;
+    return;
+  }
+  pickedCount.textContent = `${selected.length} image${selected.length === 1 ? "" : "s"} selected`;
+  renderBtn.disabled = selected.length < 2;
+}
+
+renderBtn.addEventListener("click", async () => {
+  errorBox.hidden = true;
+  result.hidden = true;
+  progress.hidden = false;
+  renderBtn.disabled = true;
+
+  fill.style.width = "0%";
+  stageLabel.textContent = "Uploading…";
+  stageCount.textContent = "";
+
+  const fd = new FormData();
+  selected.forEach((f) => fd.append("files", f, f.name));
+  fd.append("scale", $("scale").value);
+  fd.append("frames_per_pair", $("fpp").value);
+  fd.append("fps", $("fps").value);
+  fd.append("overlay", $("overlay").checked ? "true" : "false");
+
+  let job_id;
+  try {
+    const r = await fetch("/api/render", { method: "POST", body: fd });
+    if (!r.ok) {
+      const text = await r.text().catch(() => r.statusText);
+      throw new Error(text || `HTTP ${r.status}`);
+    }
+    ({ job_id } = await r.json());
+  } catch (err) {
+    showError(err.message);
+    progress.hidden = true;
+    renderBtn.disabled = false;
+    return;
+  }
+
+  activeJob = job_id;
+  followJob(job_id);
+});
+
+function followJob(jobId) {
+  const es = new EventSource(`/api/events/${jobId}`);
+  es.onmessage = (ev) => {
+    const d = JSON.parse(ev.data);
+    if (d.error) {
+      showError(d.error);
+      es.close();
+      progress.hidden = true;
+      renderBtn.disabled = false;
+      cleanupJob(jobId);
+      return;
+    }
+    updateStage(d);
+    if (d.stage === "done") {
+      es.close();
+      showResult(jobId, d);
+      renderBtn.disabled = false;
+    }
+  };
+  es.onerror = () => {
+    es.close();
+    showError("connection to server lost");
+    renderBtn.disabled = false;
+  };
+}
+
+function updateStage(d) {
+  const labels = {
+    starting: "Starting…",
+    detect: "Detecting faces",
+    triangulate: "Triangulating",
+    morph: "Morphing & encoding",
+  };
+  stageLabel.textContent = labels[d.stage] || d.stage;
+  if (d.total > 0) {
+    stageCount.textContent = `${d.current} / ${d.total}`;
+    fill.style.width = `${(d.current / d.total) * 100}%`;
+  } else {
+    stageCount.textContent = "";
+  }
+}
+
+function showResult(jobId, d) {
+  progress.hidden = true;
+  const url = `/api/download/${jobId}`;
+  video.src = url + `?t=${Date.now()}`;
+  downloadLink.href = url;
+  const parts = [`${d.duration_s.toFixed(1)} s`];
+  if (d.encoder) parts.push(d.encoder);
+  parts.push(`${d.used} photos`);
+  if (d.skipped) parts.push(`${d.skipped} skipped`);
+  resultMeta.textContent = parts.join(" · ");
+  result.hidden = false;
+}
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.hidden = false;
+}
+
+function cleanupJob(jobId) {
+  // best-effort cleanup; ignore failure
+  fetch(`/api/job/${jobId}`, { method: "DELETE" }).catch(() => {});
+}
+</script>
+</body>
+</html>

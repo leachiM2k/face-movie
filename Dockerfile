@@ -16,6 +16,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py start.sh ./
+COPY webapp ./webapp
 
 VOLUME ["/app/payload/"]
-CMD ["./start.sh"]
+EXPOSE 8080
+ENTRYPOINT ["./start.sh"]
+CMD []

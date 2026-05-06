@@ -9,18 +9,30 @@ Pipeline:
     4. For each consecutive pair (A, B), render N intermediate frames via
        per-triangle affine warps + cross-dissolve — classic Beier/Wolberg-style
        face morphing.
-    5. Pipe raw frames to ffmpeg for H.264 encode (h264_videotoolbox on
-       macOS, libx264 on Linux).
+    5. Pipe raw frames to ffmpeg for H.264 encode (hardware encoder when
+       available — h264_videotoolbox on macOS, h264_nvenc / h264_qsv /
+       h264_amf / h264_v4l2m2m on Linux — falls back to libx264).
 
-Runs natively on macOS (Apple Silicon + Intel) and Linux. No GPU required.
+Runs natively on macOS (Apple Silicon + Intel) and Linux. GPU is used
+opportunistically when present (MediaPipe landmark detection + ffmpeg HW
+encoder); CPU-only systems work unchanged.
+
+Public API:
+    run_pipeline(input_dir, output_path, ..., on_progress=cb) -> RenderResult
+
+The CLI in main() is a thin wrapper that turns the on_progress callback
+into tqdm progress bars. The web UI uses the same callback to push SSE
+events to the browser.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import cv2
 import mediapipe as mp
@@ -47,6 +59,24 @@ ANCHOR_INDICES = (
     291,  # left mouth corner
 )
 
+ProgressCallback = Callable[[str, int, int], None]
+
+
+@dataclass
+class RenderResult:
+    output_path: Path
+    canvas_w: int
+    canvas_h: int
+    fps: int
+    total_frames: int
+    used_files: list[Path]
+    skipped_files: list[Path] = field(default_factory=list)
+    encoder: str = ""
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.total_frames / self.fps
+
 
 def ensure_model() -> Path:
     """Download the FaceLandmarker model on first run; cache it under ~/.cache."""
@@ -58,13 +88,41 @@ def ensure_model() -> Path:
 
 
 def make_landmarker() -> mp_vision.FaceLandmarker:
-    options = mp_vision.FaceLandmarkerOptions(
-        base_options=mp_tasks.BaseOptions(model_asset_path=str(ensure_model())),
-        running_mode=mp_vision.RunningMode.IMAGE,
-        num_faces=1,
-        min_face_detection_confidence=0.5,
-    )
-    return mp_vision.FaceLandmarker.create_from_options(options)
+    """Try the GPU delegate first, fall back to CPU.
+
+    On macOS the GPU delegate uses Metal via TensorFlow Lite; on Linux it
+    needs an OpenGL ES context. Init failures raise and we move on to CPU.
+
+    Set FACE_MOVIE_DELEGATE=cpu to skip the GPU attempt entirely. This is
+    the escape hatch for systems where the GPU path passes init but aborts
+    deep inside libabsl on first detection (uncatchable from Python).
+    """
+    model_path = str(ensure_model())
+    Delegate = mp_tasks.BaseOptions.Delegate
+
+    forced = os.environ.get("FACE_MOVIE_DELEGATE", "auto").lower()
+    if forced == "cpu":
+        order = (Delegate.CPU,)
+    elif forced == "gpu":
+        order = (Delegate.GPU,)
+    else:
+        order = (Delegate.GPU, Delegate.CPU)
+
+    for delegate in order:
+        try:
+            options = mp_vision.FaceLandmarkerOptions(
+                base_options=mp_tasks.BaseOptions(
+                    model_asset_path=model_path,
+                    delegate=delegate,
+                ),
+                running_mode=mp_vision.RunningMode.IMAGE,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+            )
+            return mp_vision.FaceLandmarker.create_from_options(options)
+        except Exception:
+            continue
+    raise RuntimeError("could not initialize MediaPipe FaceLandmarker")
 
 
 def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
@@ -72,11 +130,12 @@ def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
 
     The FaceLandmarker returns 478 points (468 face mesh + 10 iris). We keep
     the first 468 — the iris points jitter when eyes blink and aren't useful
-    for morph triangulation.
+    for morph triangulation. RGBA is used (not RGB) so the Metal/OpenGL GPU
+    delegate path doesn't abort on the ImageFrame conversion.
     """
     h, w = image_bgr.shape[:2]
-    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    rgba = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGBA)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgba)
     result = landmarker.detect(mp_image)
     if not result.face_landmarks:
         return None
@@ -127,8 +186,6 @@ def align_to_canvas(
     )
     pts = np.hstack([landmarks, np.ones((len(landmarks), 1), dtype=np.float32)])
     aligned_lm = (pts @ M.T).astype(np.float32)
-    # Pixels outside the canvas don't exist in `aligned`; clamping is correct
-    # and prevents triangle bounding rects from slicing past the dst array.
     aligned_lm[:, 0] = np.clip(aligned_lm[:, 0], 0, canvas_w - 1)
     aligned_lm[:, 1] = np.clip(aligned_lm[:, 1], 0, canvas_h - 1)
     return aligned, aligned_lm
@@ -158,7 +215,6 @@ def delaunay_triangles(
         subdiv.insert((float(p[0]), float(p[1])))
     raw = subdiv.getTriangleList()
 
-    # Map triangle vertices back to indices in `points`.
     lookup = {(round(float(p[0]), 1), round(float(p[1]), 1)): i for i, p in enumerate(points)}
     triangles: list[tuple[int, int, int]] = []
     for t in raw:
@@ -224,19 +280,87 @@ def morph_pair(
         yield np.clip(frame, 0, 255).astype(np.uint8)
 
 
-def pick_encoder() -> list[str]:
-    """Prefer hardware encoder on macOS; fall back to libx264."""
-    if sys.platform == "darwin":
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-encoders"],
-                capture_output=True, text=True, check=False,
+def _ffmpeg_encoders() -> set[str]:
+    """Names of all encoders the ffmpeg binary advertises."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return set()
+    names: set[str] = set()
+    for line in r.stdout.splitlines():
+        # encoder lines look like " V..... h264_nvenc           NVIDIA NVENC ..."
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith("V"):
+            names.add(parts[1])
+    return names
+
+
+def _encoder_runtime_works(codec: str, extra: list[str]) -> bool:
+    """Probe a codec with a one-frame null-output encode.
+
+    `ffmpeg -encoders` listing only proves the codec was compiled in, not
+    that its runtime dependencies are present (e.g., h264_nvenc is in every
+    apt ffmpeg build but needs libcuda + an NVIDIA device at run time).
+    """
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1:r=1",
+                "-c:v", codec, *extra,
+                "-pix_fmt", "yuv420p",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+_picked_encoder_cache: tuple[str, list[str]] | None = None
+
+
+def pick_encoder(override: str | None = None) -> tuple[str, list[str]]:
+    """Choose an H.264 encoder. Returns (name, ffmpeg-args).
+
+    Honours --encoder override; otherwise prefers any hardware encoder that
+    survives a runtime probe, and falls back to libx264. The auto choice is
+    cached at process scope so repeated run_pipeline() calls don't reprobe.
+    """
+    if override:
+        candidate = override, ["-c:v", override]
+        if not _encoder_runtime_works(override, []):
+            raise RuntimeError(
+                f"encoder {override!r} cannot encode (missing driver / device?)"
             )
-            if "h264_videotoolbox" in r.stdout:
-                return ["-c:v", "h264_videotoolbox", "-b:v", "8M"]
-        except FileNotFoundError:
-            pass
-    return ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+        return candidate
+
+    global _picked_encoder_cache
+    if _picked_encoder_cache is not None:
+        return _picked_encoder_cache
+
+    available = _ffmpeg_encoders()
+    candidates: list[tuple[str, list[str]]] = []
+    if sys.platform == "darwin":
+        candidates.append(("h264_videotoolbox", ["-b:v", "8M"]))
+    candidates.extend([
+        ("h264_nvenc",     ["-preset", "p4", "-b:v", "8M"]),  # NVIDIA
+        ("h264_qsv",       ["-b:v", "8M"]),                   # Intel QuickSync
+        ("h264_amf",       ["-b:v", "8M"]),                   # AMD VCN
+        ("h264_v4l2m2m",   ["-b:v", "8M"]),                   # Raspberry Pi 4+
+    ])
+
+    for codec, extra in candidates:
+        if codec in available and _encoder_runtime_works(codec, extra):
+            _picked_encoder_cache = codec, ["-c:v", codec, *extra]
+            return _picked_encoder_cache
+
+    _picked_encoder_cache = "libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+    return _picked_encoder_cache
 
 
 def encode_video(
@@ -245,12 +369,12 @@ def encode_video(
     canvas_w: int,
     canvas_h: int,
     fps: int,
+    encoder_args: list[str],
 ) -> None:
     """Pipe BGR frames into ffmpeg as raw video and encode to H.264."""
-    # H.264 requires even dimensions for yuv420p — round up via crop (cheap).
     pad_w = canvas_w + (canvas_w & 1)
     pad_h = canvas_h + (canvas_h & 1)
-    vf_args = []
+    vf_args: list[str] = []
     if pad_w != canvas_w or pad_h != canvas_h:
         vf_args = ["-vf", f"pad={pad_w}:{pad_h}"]
 
@@ -261,7 +385,7 @@ def encode_video(
         "-r", str(fps),
         "-i", "-",
         *vf_args,
-        *pick_encoder(),
+        *encoder_args,
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
         str(output_path),
@@ -279,14 +403,186 @@ def encode_video(
 
 
 def draw_overlay(frame: np.ndarray, text: str) -> np.ndarray:
-    """Draw a filename caption in the bottom-left corner (matches the legacy tool)."""
+    """Draw a filename caption in the bottom-left corner."""
     out = frame.copy()
     h = out.shape[0]
     pos = (10, h - 12)
-    # Black outline + white fill for legibility on any background.
     cv2.putText(out, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(out, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Public pipeline
+# ---------------------------------------------------------------------------
+
+def run_pipeline(
+    input_dir: Path,
+    output_path: Path,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    scale: float = 1.0,
+    frames_per_pair: int = 6,
+    fps: int = 30,
+    overlay: bool = True,
+    keep_aligned_dir: Path | None = None,
+    encoder: str | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> RenderResult:
+    """Run the full face-movie pipeline.
+
+    `on_progress(stage, current, total)` is called as work proceeds. Stages:
+        "detect"      — landmark detection (current = files done, total = files)
+        "triangulate" — single tick at completion (1, 1)
+        "morph"       — pair morphing (current = pairs done, total = pairs)
+        "done"        — completed (1, 1)
+    """
+    input_dir = Path(input_dir)
+    output_path = Path(output_path)
+
+    files = sorted(
+        p for p in input_dir.iterdir()
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
+    if len(files) < 2:
+        raise ValueError(f"need at least 2 images in {input_dir}")
+
+    # Determine canvas dimensions — explicit args win, else first valid image.
+    if width and height:
+        canvas_w, canvas_h = width, height
+    else:
+        probe = None
+        for f in files:
+            probe = cv2.imread(str(f))
+            if probe is not None:
+                break
+        if probe is None:
+            raise ValueError(f"could not read any image in {input_dir}")
+        h0, w0 = probe.shape[:2]
+        canvas_w = width or int(round(w0 * scale))
+        canvas_h = height or int(round(h0 * scale))
+
+    template = canonical_template(canvas_w, canvas_h)
+    aligned_images: list[np.ndarray] = []
+    aligned_landmarks: list[np.ndarray] = []
+    used_files: list[Path] = []
+    skipped: list[Path] = []
+
+    if on_progress:
+        on_progress("detect", 0, len(files))
+
+    landmarker = make_landmarker()
+    try:
+        for i, f in enumerate(files, 1):
+            img = cv2.imread(str(f))
+            if img is None:
+                skipped.append(f)
+            else:
+                lm = detect_landmarks(img, landmarker)
+                if lm is None:
+                    skipped.append(f)
+                else:
+                    try:
+                        aligned_img, aligned_lm = align_to_canvas(
+                            img, lm, template, canvas_w, canvas_h,
+                        )
+                        aligned_images.append(aligned_img)
+                        aligned_landmarks.append(aligned_lm)
+                        used_files.append(f)
+                    except RuntimeError:
+                        skipped.append(f)
+            if on_progress:
+                on_progress("detect", i, len(files))
+    finally:
+        landmarker.close()
+
+    if len(aligned_images) < 2:
+        raise RuntimeError(
+            f"need at least 2 images with detectable faces; got {len(aligned_images)} "
+            f"after skipping {len(skipped)}"
+        )
+
+    if keep_aligned_dir:
+        keep_aligned_dir = Path(keep_aligned_dir)
+        keep_aligned_dir.mkdir(parents=True, exist_ok=True)
+        for f, img in zip(used_files, aligned_images, strict=True):
+            cv2.imwrite(str(keep_aligned_dir / f"c_{f.name}"), img)
+
+    bnd = boundary_points(canvas_w, canvas_h)
+    full_landmarks = [np.vstack([lm, bnd]) for lm in aligned_landmarks]
+    mean_pts = np.mean(np.stack(full_landmarks), axis=0)
+    triangles = delaunay_triangles(mean_pts, canvas_w, canvas_h)
+    if on_progress:
+        on_progress("triangulate", 1, 1)
+
+    n_pairs = len(aligned_images) - 1
+    if on_progress:
+        on_progress("morph", 0, n_pairs)
+
+    def all_frames() -> Iterable[np.ndarray]:
+        for i in range(n_pairs):
+            include_endpoint = (i == n_pairs - 1)
+            label_a = used_files[i].stem
+            label_b = used_files[i + 1].stem
+            for j, frame in enumerate(morph_pair(
+                aligned_images[i], aligned_images[i + 1],
+                full_landmarks[i], full_landmarks[i + 1],
+                triangles, frames_per_pair, include_endpoint,
+            )):
+                if overlay:
+                    t = j / frames_per_pair
+                    frame = draw_overlay(frame, label_b if t >= 0.5 else label_a)
+                yield frame
+            if on_progress:
+                on_progress("morph", i + 1, n_pairs)
+
+    encoder_name, encoder_args = pick_encoder(encoder)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    encode_video(all_frames(), output_path, canvas_w, canvas_h, fps, encoder_args)
+
+    total_frames = n_pairs * frames_per_pair + 1
+    if on_progress:
+        on_progress("done", 1, 1)
+
+    return RenderResult(
+        output_path=output_path,
+        canvas_w=canvas_w, canvas_h=canvas_h,
+        fps=fps, total_frames=total_frames,
+        used_files=used_files, skipped_files=skipped,
+        encoder=encoder_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cli_progress() -> ProgressCallback:
+    """Translate on_progress events into tqdm bars + headers."""
+    bars: dict[str, tqdm] = {}
+    seen_stages: set[str] = set()
+
+    headers = {
+        "detect":      "[1/3] detecting landmarks",
+        "triangulate": "[2/3] computing template + Delaunay triangulation",
+        "morph":       "[3/3] morphing + encoding",
+    }
+
+    def cb(stage: str, current: int, total: int) -> None:
+        if stage in headers and stage not in seen_stages:
+            print(headers[stage])
+            seen_stages.add(stage)
+        if stage == "triangulate" or stage == "done":
+            return
+        if stage not in bars:
+            bars[stage] = tqdm(total=total, desc=stage, leave=True)
+        bars[stage].n = current
+        bars[stage].refresh()
+        if current == total:
+            bars[stage].close()
+
+    return cb
 
 
 def main() -> int:
@@ -308,117 +604,37 @@ def main() -> int:
                     help="Disable the filename caption burned into each frame.")
     ap.add_argument("--keep-aligned", action="store_true",
                     help="Also dump aligned still frames into --output.")
+    ap.add_argument("--encoder", default=None,
+                    help="Force a specific ffmpeg encoder (e.g. libx264, h264_nvenc). "
+                         "Default: auto-detect, prefer hardware.")
     args = ap.parse_args()
 
-    files = sorted(
-        p for p in args.input.iterdir()
-        if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
-    )
-    if len(files) < 2:
-        print(f"need at least 2 images in {args.input}", file=sys.stderr)
-        return 1
-
-    # Determine canvas dimensions — explicit flags win, else first valid image.
-    if args.width and args.height:
-        canvas_w, canvas_h = args.width, args.height
-    else:
-        probe = None
-        for f in files:
-            probe = cv2.imread(str(f))
-            if probe is not None:
-                break
-        if probe is None:
-            print(f"could not read any image in {args.input}", file=sys.stderr)
-            return 1
-        h0, w0 = probe.shape[:2]
-        canvas_w = args.width or int(round(w0 * args.scale))
-        canvas_h = args.height or int(round(h0 * args.scale))
-
-    print(f"[1/4] detecting landmarks in {len(files)} images "
-          f"(canvas {canvas_w}x{canvas_h})")
-    template = canonical_template(canvas_w, canvas_h)
-    aligned_images: list[np.ndarray] = []
-    aligned_landmarks: list[np.ndarray] = []
-    used_files: list[Path] = []
-    skipped: list[Path] = []
-
-    landmarker = make_landmarker()
     try:
-        for f in tqdm(files):
-            img = cv2.imread(str(f))
-            if img is None:
-                skipped.append(f)
-                continue
-            lm = detect_landmarks(img, landmarker)
-            if lm is None:
-                skipped.append(f)
-                continue
-            try:
-                aligned_img, aligned_lm = align_to_canvas(
-                    img, lm, template, canvas_w, canvas_h,
-                )
-            except RuntimeError:
-                skipped.append(f)
-                continue
-            aligned_images.append(aligned_img)
-            aligned_landmarks.append(aligned_lm)
-            used_files.append(f)
-    finally:
-        landmarker.close()
-
-    if skipped:
-        print(f"  skipped {len(skipped)} (no face / unreadable):")
-        for p in skipped[:10]:
-            print(f"    - {p.name}")
-        if len(skipped) > 10:
-            print(f"    ... and {len(skipped) - 10} more")
-
-    if len(aligned_images) < 2:
-        print("not enough usable images after alignment", file=sys.stderr)
+        result = run_pipeline(
+            args.input, args.video,
+            width=args.width, height=args.height, scale=args.scale,
+            frames_per_pair=args.frames_per_pair, fps=args.fps,
+            overlay=not args.no_overlay,
+            keep_aligned_dir=args.output if args.keep_aligned else None,
+            encoder=args.encoder,
+            on_progress=_cli_progress(),
+        )
+    except (ValueError, RuntimeError) as e:
+        print(f"error: {e}", file=sys.stderr)
         return 1
 
-    if args.keep_aligned:
-        args.output.mkdir(parents=True, exist_ok=True)
-        for f, img in zip(used_files, aligned_images, strict=True):
-            cv2.imwrite(str(args.output / f"c_{f.name}"), img)
+    if result.skipped_files:
+        print(f"  skipped {len(result.skipped_files)} (no face / unreadable):")
+        for p in result.skipped_files[:10]:
+            print(f"    - {p.name}")
+        if len(result.skipped_files) > 10:
+            print(f"    ... and {len(result.skipped_files) - 10} more")
 
-    print("[2/4] computing template + Delaunay triangulation")
-    bnd = boundary_points(canvas_w, canvas_h)
-    full_landmarks = [np.vstack([lm, bnd]) for lm in aligned_landmarks]
-    mean_pts = np.mean(np.stack(full_landmarks), axis=0)
-    triangles = delaunay_triangles(mean_pts, canvas_w, canvas_h)
-    print(f"  {len(triangles)} triangles over {len(mean_pts)} vertices")
-
-    n_pairs = len(aligned_images) - 1
-    print(f"[3/4] morphing {n_pairs} pairs × {args.frames_per_pair} frames each")
-
-    def all_frames() -> Iterable[np.ndarray]:
-        pbar = tqdm(total=n_pairs)
-        for i in range(n_pairs):
-            include_endpoint = (i == n_pairs - 1)
-            label_a = used_files[i].stem
-            label_b = used_files[i + 1].stem
-            for j, frame in enumerate(morph_pair(
-                aligned_images[i], aligned_images[i + 1],
-                full_landmarks[i], full_landmarks[i + 1],
-                triangles, args.frames_per_pair, include_endpoint,
-            )):
-                if not args.no_overlay:
-                    # Show A's label until t crosses 0.5, then B's. With
-                    # frames_per_pair=N, t = j/N (or j/(N-1) on last pair).
-                    t = j / args.frames_per_pair
-                    frame = draw_overlay(frame, label_b if t >= 0.5 else label_a)
-                yield frame
-            pbar.update(1)
-        pbar.close()
-
-    print(f"[4/4] encoding to {args.video}")
-    args.video.parent.mkdir(parents=True, exist_ok=True)
-    encode_video(all_frames(), args.video, canvas_w, canvas_h, args.fps)
-
-    total_frames = n_pairs * args.frames_per_pair + 1
-    print(f"done: {args.video} ({total_frames} frames @ {args.fps} fps "
-          f"= {total_frames / args.fps:.1f}s)")
+    print(
+        f"done: {result.output_path} "
+        f"({result.total_frames} frames @ {result.fps} fps "
+        f"= {result.duration_seconds:.1f}s) [{result.encoder}]"
+    )
     return 0
 
 

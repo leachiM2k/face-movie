@@ -41,15 +41,27 @@ This is real face morphing — not a crossfade. The pipeline:
 3. **Triangulates** the mean face shape with Delaunay
 4. **Morphs** every consecutive pair via piecewise-affine warps over the
    triangle mesh, plus a cross-dissolve in pixel space
-5. **Encodes** H.264 with `h264_videotoolbox` on macOS or `libx264`
-   elsewhere — no GPU required
+5. **Encodes** H.264 with the best hardware encoder available — `h264_videotoolbox`
+   on macOS, `h264_nvenc` / `h264_qsv` / `h264_amf` / `h264_v4l2m2m` on Linux,
+   or `libx264` if no HW path is present. MediaPipe also uses the GPU delegate
+   (Metal / OpenGL ES) for landmark detection when present. CPU-only systems
+   still work unchanged.
 
 A photo from 2016 visibly *becomes* a photo from 2024, instead of fading
 through a ghost.
 
 ## Quick start
 
-### Docker
+### Docker — Web UI
+
+```bash
+docker run --rm -p 8080:8080 leachim2k/face-movie:latest web
+```
+
+Open <http://localhost:8080>, drop in a folder of selfies, watch the result.
+Photos never leave your machine — the container processes everything locally.
+
+### Docker — CLI
 
 ```bash
 docker run --rm -v "$PWD/payload:/app/payload" leachim2k/face-movie:latest
@@ -65,7 +77,9 @@ git clone https://github.com/leachiM2k/face-movie.git
 cd face-movie
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python main.py
+
+python main.py                                                      # CLI
+uvicorn webapp.server:app --host 127.0.0.1 --port 8080              # Web UI
 ```
 
 Three sample portraits ship in `payload/input/` so you can see output
@@ -83,6 +97,10 @@ on the first run without supplying any photos of your own.
 | `--fps N` | `30` | output frame rate |
 | `--no-overlay` | off | disable the burned-in filename caption |
 | `--keep-aligned` | off | also dump aligned still frames (debug) |
+| `--encoder NAME` | auto | force a specific ffmpeg encoder (`libx264`, `h264_nvenc`, …) |
+
+Environment variable `FACE_MOVIE_DELEGATE=cpu` forces MediaPipe onto the CPU
+path — useful if the GPU delegate aborts on your driver/SDK combination.
 
 For 750 photos at default settings, expect 10–15 min on an M-series Mac.
 
