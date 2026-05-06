@@ -20,4 +20,5 @@ COPY webapp ./webapp
 
 VOLUME ["/app/payload/"]
 EXPOSE 8080
-CMD ["./start.sh"]
+ENTRYPOINT ["./start.sh"]
+CMD []

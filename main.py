@@ -298,36 +298,69 @@ def _ffmpeg_encoders() -> set[str]:
     return names
 
 
+def _encoder_runtime_works(codec: str, extra: list[str]) -> bool:
+    """Probe a codec with a one-frame null-output encode.
+
+    `ffmpeg -encoders` listing only proves the codec was compiled in, not
+    that its runtime dependencies are present (e.g., h264_nvenc is in every
+    apt ffmpeg build but needs libcuda + an NVIDIA device at run time).
+    """
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1:r=1",
+                "-c:v", codec, *extra,
+                "-pix_fmt", "yuv420p",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+_picked_encoder_cache: tuple[str, list[str]] | None = None
+
+
 def pick_encoder(override: str | None = None) -> tuple[str, list[str]]:
     """Choose an H.264 encoder. Returns (name, ffmpeg-args).
 
-    Honours --encoder override; otherwise prefers any hardware encoder ffmpeg
-    advertises, with a sensible per-codec arg set, and falls back to libx264.
-    Note: ffmpeg listing an encoder does not guarantee runtime success — a
-    missing GPU driver still surfaces as an ffmpeg error during encode.
+    Honours --encoder override; otherwise prefers any hardware encoder that
+    survives a runtime probe, and falls back to libx264. The auto choice is
+    cached at process scope so repeated run_pipeline() calls don't reprobe.
     """
-    available = _ffmpeg_encoders()
-
     if override:
-        if override not in available:
-            raise RuntimeError(f"encoder {override!r} not available; have: {sorted(available)}")
-        return override, ["-c:v", override]
+        candidate = override, ["-c:v", override]
+        if not _encoder_runtime_works(override, []):
+            raise RuntimeError(
+                f"encoder {override!r} cannot encode (missing driver / device?)"
+            )
+        return candidate
 
-    # macOS: prefer videotoolbox (Apple Silicon + Intel both supported).
-    if sys.platform == "darwin" and "h264_videotoolbox" in available:
-        return "h264_videotoolbox", ["-c:v", "h264_videotoolbox", "-b:v", "8M"]
+    global _picked_encoder_cache
+    if _picked_encoder_cache is not None:
+        return _picked_encoder_cache
 
-    # Linux + others: try hardware encoders in order of typical availability.
-    for codec, extra in (
+    available = _ffmpeg_encoders()
+    candidates: list[tuple[str, list[str]]] = []
+    if sys.platform == "darwin":
+        candidates.append(("h264_videotoolbox", ["-b:v", "8M"]))
+    candidates.extend([
         ("h264_nvenc",     ["-preset", "p4", "-b:v", "8M"]),  # NVIDIA
         ("h264_qsv",       ["-b:v", "8M"]),                   # Intel QuickSync
         ("h264_amf",       ["-b:v", "8M"]),                   # AMD VCN
         ("h264_v4l2m2m",   ["-b:v", "8M"]),                   # Raspberry Pi 4+
-    ):
-        if codec in available:
-            return codec, ["-c:v", codec, *extra]
+    ])
 
-    return "libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+    for codec, extra in candidates:
+        if codec in available and _encoder_runtime_works(codec, extra):
+            _picked_encoder_cache = codec, ["-c:v", codec, *extra]
+            return _picked_encoder_cache
+
+    _picked_encoder_cache = "libx264", ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+    return _picked_encoder_cache
 
 
 def encode_video(
