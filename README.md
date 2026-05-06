@@ -16,7 +16,21 @@ while expressions, lighting, and the years flow past.
 - Watching kids grow up
 - Any series of portraits where the face moves around between shots
 
-## Why it works
+## Why?
+
+Google Picasa 3 used to ship a feature called **Face Movie** that did
+exactly this — align faces across a batch of photos and stitch them into
+a smooth video. Picasa was discontinued in 2016, and nothing in the major
+photo apps has replaced it.
+
+This project began in August 2016. The author started taking a selfie
+every morning at 9am, planning to one day watch a smooth time-lapse of
+how he changed. Five years and 750 photos later, a naive slideshow looked
+like a strobe — head in a different spot, different tilt, every single
+frame. Face-Movie is the fix: what Picasa 3 used to do, kept alive with
+a modern toolchain.
+
+## How it works
 
 This is real face morphing — not a crossfade. The pipeline:
 
@@ -80,10 +94,3 @@ macOS (Apple Silicon + Intel) and Linux (x86 + ARM).
 The 2.x rewrite replaced TensorFlow + dlib + face-recognition + MTCNN
 with MediaPipe alone, dropped the Docker image from ~1.5 GB to ~600 MB,
 and cut the build time from 14 min to ~2 min.
-
-## Background
-
-Started in August 2016 as a personal project. The author began taking a
-selfie every morning at 9am. Five years and 750 photos later, a naive
-slideshow looked like a strobe — head in a different place, different
-tilt, every frame. Face-Movie was the fix.
