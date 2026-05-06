@@ -1,24 +1,21 @@
-FROM python:3.8-slim-buster as builder
-
-COPY ./requirements.txt .
-
-RUN apt-get update && apt-get install -y g++ cmake
-
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir --user -r requirements.txt
-
-# Stage 2: Runtime
-FROM python:3.8.2-slim
+FROM python:3.12-slim
 
 LABEL maintainer="leachim2k@leachim2k.de"
 
+# ffmpeg + minimal libs for opencv-python and mediapipe
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-COPY --from=builder /root/.local/lib/python3.8/site-packages /usr/local/lib/python3.8/site-packages
-COPY . .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN apt-get update \
-    && apt-get install -y ffmpeg  \
-    && apt-get clean
+COPY main.py start.sh ./
+
 VOLUME ["/app/payload/"]
-CMD [ "./start.sh"]
+CMD ["./start.sh"]
