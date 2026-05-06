@@ -119,6 +119,11 @@ def align_to_canvas(
     )
     pts = np.hstack([landmarks, np.ones((len(landmarks), 1), dtype=np.float32)])
     aligned_lm = (pts @ M.T).astype(np.float32)
+    # MediaPipe occasionally puts landmarks (chin, ears, jaw) slightly outside
+    # the original image, and Procrustes can map them outside the canvas. Pixels
+    # outside the canvas don't exist in `aligned`, so clamping is correct — and
+    # it prevents triangle bounding rects from slicing past the dst array.
+    np.clip(aligned_lm, 0, canvas_size - 1, out=aligned_lm)
     return aligned, aligned_lm
 
 
