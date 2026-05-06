@@ -100,6 +100,7 @@ on the first run without supplying any photos of your own.
 | `--encoder NAME` | auto | force a specific ffmpeg encoder (`libx264`, `h264_nvenc`, …) |
 | `--front-facing-only` | off | skip photos where the head is turned away from the camera |
 | `--max-asymmetry N` | `0.20` | front-facing tolerance — lower = stricter (only with `--front-facing-only`) |
+| `--halo-factor N` | `1.25` | extra anchor ring around the face for smoother face-edge morphing — `1.0` disables |
 
 The web UI exposes a **"Only include front-facing photos"** checkbox for
 the same filter, useful when cleaning up a large archive that mixes

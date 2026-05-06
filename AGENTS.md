@@ -230,6 +230,12 @@ These are bugs / surprises that already cost a debug round. Read them.
   dict. Point coincidences after averaging across 1000+ images are
   rare but possible. If you ever see triangles drop out of the mesh
   unexpectedly, that's the first place to look.
+- `halo_points()` adds 36 anchors around the face oval, extrapolated
+  outward by `halo_factor` (default 1.25). Without them the area
+  between face-edge and canvas-edge is one big triangle that pulls on
+  the face-oval anchors as the face shape changes — visible as
+  rubbery edges. Halo points are clipped to canvas (extrapolation can
+  push them off-image when the face fills the frame).
 
 ### Pose filtering
 

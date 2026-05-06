@@ -59,6 +59,15 @@ ANCHOR_INDICES = (
     291,  # left mouth corner
 )
 
+# MediaPipe FACEMESH_FACE_OVAL — the 36 indices that trace the face contour
+# (forehead → temple → cheek → jaw → chin → up the other side). Used to
+# build the "halo" ring of extra anchors just outside the face.
+FACE_OVAL_INDICES = (
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
+)
+
 ProgressCallback = Callable[[str, int, int], None]
 
 
@@ -235,6 +244,39 @@ def boundary_points(canvas_w: int, canvas_h: int) -> np.ndarray:
         pts.append((0, y))
         pts.append((canvas_w - 1, y))
     return np.array(pts, dtype=np.float32)
+
+
+def halo_points(
+    landmarks: np.ndarray,
+    factor: float,
+    canvas_w: int,
+    canvas_h: int,
+) -> np.ndarray:
+    """Extrapolate FACEMESH_FACE_OVAL points outward from the face center.
+
+    The face mesh densely covers the face surface but stops at the oval.
+    Between the oval and the canvas border, the triangulation has only the
+    sparse boundary points, so the few large triangles spanning that gap
+    pull on the face-edge anchors as the face shape changes — visible as
+    a "rubbery edge" in the morph.
+
+    For each oval landmark P we add an extra anchor at:
+        center + (P - center) * factor
+
+    A factor of 1 disables the ring (anchors coincide with the oval, no
+    benefit); 1.25 is a gentle outward push that adds dedicated anchors
+    in the immediate ring around the face. Points are clipped to the
+    canvas because the extrapolation can push them off-image when the
+    face fills the frame.
+    """
+    if factor <= 1.0:
+        return np.empty((0, 2), dtype=np.float32)
+    oval = landmarks[list(FACE_OVAL_INDICES)]
+    center = oval.mean(axis=0)
+    halo = (center + (oval - center) * factor).astype(np.float32)
+    halo[:, 0] = np.clip(halo[:, 0], 0, canvas_w - 1)
+    halo[:, 1] = np.clip(halo[:, 1], 0, canvas_h - 1)
+    return halo
 
 
 def delaunay_triangles(
@@ -462,6 +504,7 @@ def run_pipeline(
     encoder: str | None = None,
     front_facing_only: bool = False,
     max_asymmetry: float = 0.20,
+    halo_factor: float = 1.25,
     on_progress: ProgressCallback | None = None,
 ) -> RenderResult:
     """Run the full face-movie pipeline.
@@ -550,7 +593,14 @@ def run_pipeline(
             cv2.imwrite(str(keep_aligned_dir / f"c_{f.name}"), img)
 
     bnd = boundary_points(canvas_w, canvas_h)
-    full_landmarks = [np.vstack([lm, bnd]) for lm in aligned_landmarks]
+    full_landmarks = [
+        np.vstack([
+            lm,
+            halo_points(lm, halo_factor, canvas_w, canvas_h),
+            bnd,
+        ])
+        for lm in aligned_landmarks
+    ]
     mean_pts = np.mean(np.stack(full_landmarks), axis=0)
     triangles = delaunay_triangles(mean_pts, canvas_w, canvas_h)
     if on_progress:
@@ -654,6 +704,10 @@ def main() -> int:
     ap.add_argument("--max-asymmetry", default=0.20, type=float,
                     help="Front-facing tolerance (0.0–1.0). Lower = stricter. "
                          "Only used with --front-facing-only.")
+    ap.add_argument("--halo-factor", default=1.25, type=float,
+                    help="Outward extrapolation of FACEMESH_FACE_OVAL anchors "
+                         "for smoother face-edge morphing. 1.0 disables; "
+                         "1.25 is the default; 1.5+ gets aggressive.")
     args = ap.parse_args()
 
     try:
@@ -666,6 +720,7 @@ def main() -> int:
             encoder=args.encoder,
             front_facing_only=args.front_facing_only,
             max_asymmetry=args.max_asymmetry,
+            halo_factor=args.halo_factor,
             on_progress=_cli_progress(),
         )
     except (ValueError, RuntimeError) as e:
