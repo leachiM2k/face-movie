@@ -1,76 +1,89 @@
 # Face-Movie
 
-Aligns faces across a series of photos and renders a smoothly morphed video —
-for example, "one selfie a day for ten years" turning into a 30-second clip.
+> **Take a selfie every morning. Years later, watch yourself grow up.**
 
-**Why?**
+Face-Movie turns a folder of portraits into a smoothly morphed time-lapse
+video. Faces stay locked in place — eyes at the same spot in every frame —
+while expressions, lighting, and the years flow past.
 
-Since August 2016 I've been taking a selfie every morning at 9am. Now, several
-hundred photos in, I wanted to watch how my face changed over the years. But
-the head sits in a different spot, at a different tilt, in every photo — so a
-naive slideshow looks like a strobe. This tool aligns each face to a canonical
-pose, then morphs between consecutive photos with real piecewise-affine warps
-(not just a crossfade).
+![demo](docs/demo.gif)
 
-## Pipeline
+## What it's for
 
-1. **Detect** 468 face landmarks per image with MediaPipe Face Mesh.
-2. **Align** every image onto a canonical canvas via a Procrustes (similarity)
-   transform on a stable 5-point subset (eye corners, nose tip, mouth corners).
-3. **Triangulate** once: Delaunay over the mean of all aligned landmark sets,
-   plus a grid of pinned boundary points so the warp covers the full canvas.
-4. **Morph** N intermediate frames between every consecutive pair via
-   per-triangle affine warps + cross-dissolve (Beier/Wolberg-style).
-5. **Encode** to MP4 with ffmpeg — `h264_videotoolbox` on macOS, `libx264`
-   elsewhere.
+- The "one selfie a day" project, finally watchable
+- Beard, hair-loss, weight-change, gym, or makeup journeys
+- Pregnancy progression, post-surgery recovery
+- Watching kids grow up
+- Any series of portraits where the face moves around between shots
 
-No GPU needed. Runs on macOS (Apple Silicon + Intel) and Linux.
+## Why it works
+
+This is real face morphing — not a crossfade. The pipeline:
+
+1. **Detects 468 face landmarks** per image with MediaPipe Face Mesh
+2. **Aligns** each face onto a canonical pose with a Procrustes transform
+   (eyes, nose, and mouth corners are the anchors — robust across head tilt,
+   pose, and expression)
+3. **Triangulates** the mean face shape with Delaunay
+4. **Morphs** every consecutive pair via piecewise-affine warps over the
+   triangle mesh, plus a cross-dissolve in pixel space
+5. **Encodes** H.264 with `h264_videotoolbox` on macOS or `libx264`
+   elsewhere — no GPU required
+
+A photo from 2016 visibly *becomes* a photo from 2024, instead of fading
+through a ghost.
 
 ## Quick start
-
-Drop your JPEGs into `./payload/input` and run:
 
 ### Docker
 
 ```bash
-docker run --rm -v "${PWD}/payload:/app/payload" --name face-movie \
-    leachim2k/face-movie:latest
+docker run --rm -v "$PWD/payload:/app/payload" leachim2k/face-movie:latest
 ```
 
-To build locally: `docker build --tag leachim2k/face-movie:latest .`
-(image is ~600 MB; build takes ~2 minutes — down from 14 min in the old
-TensorFlow-based version).
+Drop your portraits into `payload/input/` first. The result lands at
+`payload/out_morphed.mp4`.
 
-### Local Python
-
-Requires Python 3.10–3.12 (mediapipe doesn't yet support 3.13+). Use a venv:
+### Python
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/leachiM2k/face-movie.git
+cd face-movie
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-./start.sh
+python main.py
 ```
 
-The output lands at `payload/out_morphed.mp4`.
+Three sample portraits ship in `payload/input/` so you can see output
+on the first run without supplying any photos of your own.
 
-## CLI options
+## Options
 
-```
-python main.py [--input DIR]            # default: payload/input
-               [--video PATH]           # default: payload/out_morphed.mp4
-               [--size N]               # canvas px (default 720; try 1080 for sharper)
-               [--frames-per-pair N]    # morph frames between photos (default 6)
-               [--fps N]                # default 30
-               [--keep-aligned]         # also dump aligned stills to --output
-```
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `--input DIR` | `payload/input` | source folder of JPEG/PNG portraits |
+| `--video PATH` | `payload/out_morphed.mp4` | where to write the result |
+| `--scale N` | `1.0` | proportional scale on the auto-detected canvas (`0.5` = half-size) |
+| `--width N` / `--height N` | auto | override canvas dimensions explicitly |
+| `--frames-per-pair N` | `6` | morph frames between two photos — higher = slower transitions |
+| `--fps N` | `30` | output frame rate |
+| `--no-overlay` | off | disable the burned-in filename caption |
+| `--keep-aligned` | off | also dump aligned still frames (debug) |
 
-A 750-photo run with defaults produces a ~150-second video and takes roughly
-10–15 minutes on an M-series Mac.
+For 750 photos at default settings, expect 10–15 min on an M-series Mac.
 
-## Stack
+## What's under the hood
 
-- Python 3.12
-- [MediaPipe](https://github.com/google-ai-edge/mediapipe) Face Mesh
-- OpenCV (Subdiv2D for Delaunay, warpAffine for piecewise warps)
-- ffmpeg
+Python 3.12 · MediaPipe Face Mesh · OpenCV · ffmpeg. No GPU. Native on
+macOS (Apple Silicon + Intel) and Linux (x86 + ARM).
+
+The 2.x rewrite replaced TensorFlow + dlib + face-recognition + MTCNN
+with MediaPipe alone, dropped the Docker image from ~1.5 GB to ~600 MB,
+and cut the build time from 14 min to ~2 min.
+
+## Background
+
+Started in August 2016 as a personal project. The author began taking a
+selfie every morning at 9am. Five years and 750 photos later, a naive
+slideshow looked like a strobe — head in a different place, different
+tilt, every frame. Face-Movie was the fix.
