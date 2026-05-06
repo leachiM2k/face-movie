@@ -25,16 +25,20 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import UploadFile
 
 # Allow running `uvicorn webapp.server:app` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from main import run_pipeline  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-MAX_FILES = 5000  # sanity cap on a single upload
+# Sanity cap. Picked above any realistic "selfie a day for 25 years" upload.
+# python-multipart's default of 1000 is too low; we override it explicitly
+# when parsing the form below.
+MAX_FILES = 25_000
 
 app = FastAPI(title="Face-Movie")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -66,17 +70,32 @@ async def index() -> HTMLResponse:
 
 
 @app.post("/api/render")
-async def start_render(
-    files: list[UploadFile] = File(...),
-    scale: float = Form(1.0),
-    frames_per_pair: int = Form(6),
-    fps: int = Form(30),
-    overlay: bool = Form(True),
-):
+async def start_render(request: Request):
+    # We parse the form ourselves so we can raise the multipart parser's
+    # max_files / max_fields limits beyond python-multipart's 1000 default.
+    # FastAPI's File()/Form() dependencies don't expose those knobs.
+    try:
+        form = await request.form(
+            max_files=MAX_FILES + 1,
+            max_fields=MAX_FILES + 32,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"could not parse upload: {e}") from e
+
+    files = [f for f in form.getlist("files") if isinstance(f, UploadFile)]
     if len(files) < 2:
         raise HTTPException(400, "need at least 2 images")
     if len(files) > MAX_FILES:
         raise HTTPException(413, f"too many files (>{MAX_FILES})")
+
+    try:
+        scale = float(form.get("scale", "1.0"))
+        frames_per_pair = int(form.get("frames_per_pair", "6"))
+        fps = int(form.get("fps", "30"))
+        overlay = str(form.get("overlay", "true")).lower() in ("true", "1", "yes", "on")
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, f"invalid parameter: {e}") from e
+
     if not (0.1 <= scale <= 1.0):
         raise HTTPException(400, "scale must be between 0.1 and 1.0")
     if not (1 <= frames_per_pair <= 60):
