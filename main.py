@@ -128,6 +128,9 @@ def make_landmarker() -> mp_vision.FaceLandmarker:
                 running_mode=mp_vision.RunningMode.IMAGE,
                 num_faces=1,
                 min_face_detection_confidence=0.5,
+                # Returns the 4×4 transform from the canonical face model to
+                # camera space; we use it for an honest head-pose filter.
+                output_facial_transformation_matrixes=True,
             )
             return mp_vision.FaceLandmarker.create_from_options(options)
         except Exception:
@@ -135,13 +138,19 @@ def make_landmarker() -> mp_vision.FaceLandmarker:
     raise RuntimeError("could not initialize MediaPipe FaceLandmarker")
 
 
-def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
-    """Return Nx2 landmark pixel coordinates, or None if no face was found.
+def detect_landmarks(
+    image_bgr: np.ndarray, landmarker,
+) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """Return ((Nx2 landmarks), 4x4 pose matrix or None), or None if no face.
 
     The FaceLandmarker returns 478 points (468 face mesh + 10 iris). We keep
     the first 468 — the iris points jitter when eyes blink and aren't useful
     for morph triangulation. RGBA is used (not RGB) so the Metal/OpenGL GPU
     delegate path doesn't abort on the ImageFrame conversion.
+
+    The pose matrix is `None` when MediaPipe found a face but couldn't fit a
+    transform — typically extreme profile shots where the 3D solver fails.
+    Treated as "not front-facing" by the filter.
     """
     h, w = image_bgr.shape[:2]
     rgba = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGBA)
@@ -150,38 +159,38 @@ def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
     if not result.face_landmarks:
         return None
     lm = result.face_landmarks[0][:468]
-    return np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
+    coords = np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
+    matrix = None
+    if result.facial_transformation_matrixes:
+        matrix = np.array(result.facial_transformation_matrixes[0], dtype=np.float32)
+    return coords, matrix
 
 
-def is_front_facing(landmarks: np.ndarray, max_asymmetry: float) -> bool:
-    """True if the head looks roughly at the camera (yaw filter).
+def is_front_facing(matrix: np.ndarray | None, max_head_tilt_deg: float) -> bool:
+    """True if the head is roughly facing the camera, by 3D pose.
 
-    A 2D-symmetry check on the five anchor points: the sum of nose-to-eye
-    plus nose-to-mouth-corner distances should be similar on the left and
-    right sides. Strong yaw collapses one side onto the nose, blowing the
-    asymmetry up. Pitch is harder to detect from 2D alone — for selfies
-    that's rarely the failure mode anyway, so we skip it here.
+    MediaPipe's facial transformation matrix maps the canonical face model
+    into camera space. Its rotation 3×3 carries the head pose; column 2 is
+    the face's forward axis (out of the nose). Its z-component equals
+    cos(angle between forward and the camera optical axis) — exactly what
+    we need.
 
-    asymmetry := |left_d - right_d| / (left_d + right_d) ∈ [0, 1]
-        - ~0.00 perfectly facing camera
-        - ~0.10 mild head turn (~15°)
-        - ~0.20 noticeable turn (~25°)
-        - >0.40 profile-ish
+    Threshold tuning:
+        max_head_tilt_deg = 15  → cos ≈ 0.966   strict frontal
+        max_head_tilt_deg = 20  → cos ≈ 0.940   default, ~all clean selfies pass
+        max_head_tilt_deg = 30  → cos ≈ 0.866   loose, lets through ~30° turns
 
-    Default threshold of 0.20 catches most "looking off-camera" cases while
-    keeping natural face asymmetry untouched.
+    A `None` matrix (face detected but pose solver failed) counts as not
+    front-facing — that case shows up almost exclusively for full profiles.
+
+    The 2D-symmetry filter this replaces missed real profiles entirely:
+    MediaPipe Face Mesh interpolates occluded landmarks from a 3D template,
+    so 2D symmetry stays high even when the head is fully turned.
     """
-    nose = landmarks[1]
-    left_eye = landmarks[263]
-    right_eye = landmarks[33]
-    left_mouth = landmarks[291]
-    right_mouth = landmarks[61]
-    left_d = float(np.linalg.norm(left_eye - nose) + np.linalg.norm(left_mouth - nose))
-    right_d = float(np.linalg.norm(right_eye - nose) + np.linalg.norm(right_mouth - nose))
-    total = left_d + right_d
-    if total <= 1e-3:
+    if matrix is None:
         return False
-    return abs(left_d - right_d) / total < max_asymmetry
+    forward_z = float(matrix[2, 2])
+    return forward_z >= float(np.cos(np.radians(max_head_tilt_deg)))
 
 
 def canonical_template(canvas_w: int, canvas_h: int) -> np.ndarray:
@@ -503,7 +512,7 @@ def run_pipeline(
     keep_aligned_dir: Path | None = None,
     encoder: str | None = None,
     front_facing_only: bool = False,
-    max_asymmetry: float = 0.20,
+    max_head_tilt_deg: float = 20.0,
     halo_factor: float = 1.25,
     on_progress: ProgressCallback | None = None,
 ) -> RenderResult:
@@ -557,21 +566,23 @@ def run_pipeline(
             if img is None:
                 skipped.append(f)
             else:
-                lm = detect_landmarks(img, landmarker)
-                if lm is None:
+                detected = detect_landmarks(img, landmarker)
+                if detected is None:
                     skipped.append(f)
-                elif front_facing_only and not is_front_facing(lm, max_asymmetry):
-                    pose_filtered.append(f)
                 else:
-                    try:
-                        aligned_img, aligned_lm = align_to_canvas(
-                            img, lm, template, canvas_w, canvas_h,
-                        )
-                        aligned_images.append(aligned_img)
-                        aligned_landmarks.append(aligned_lm)
-                        used_files.append(f)
-                    except RuntimeError:
-                        skipped.append(f)
+                    lm, matrix = detected
+                    if front_facing_only and not is_front_facing(matrix, max_head_tilt_deg):
+                        pose_filtered.append(f)
+                    else:
+                        try:
+                            aligned_img, aligned_lm = align_to_canvas(
+                                img, lm, template, canvas_w, canvas_h,
+                            )
+                            aligned_images.append(aligned_img)
+                            aligned_landmarks.append(aligned_lm)
+                            used_files.append(f)
+                        except RuntimeError:
+                            skipped.append(f)
             if on_progress:
                 on_progress("detect", i, len(files))
     finally:
@@ -701,8 +712,9 @@ def main() -> int:
     ap.add_argument("--front-facing-only", action="store_true",
                     help="Skip photos where the head is turned away from the camera. "
                          "Useful for cleaning up large archives.")
-    ap.add_argument("--max-asymmetry", default=0.20, type=float,
-                    help="Front-facing tolerance (0.0–1.0). Lower = stricter. "
+    ap.add_argument("--max-head-tilt-deg", default=20.0, type=float,
+                    help="Front-facing tolerance in degrees (any axis). "
+                         "20°≈default, 15°=strict, 30°=loose. "
                          "Only used with --front-facing-only.")
     ap.add_argument("--halo-factor", default=1.25, type=float,
                     help="Outward extrapolation of FACEMESH_FACE_OVAL anchors "
@@ -719,7 +731,7 @@ def main() -> int:
             keep_aligned_dir=args.output if args.keep_aligned else None,
             encoder=args.encoder,
             front_facing_only=args.front_facing_only,
-            max_asymmetry=args.max_asymmetry,
+            max_head_tilt_deg=args.max_head_tilt_deg,
             halo_factor=args.halo_factor,
             on_progress=_cli_progress(),
         )

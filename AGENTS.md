@@ -239,17 +239,21 @@ These are bugs / surprises that already cost a debug round. Read them.
 
 ### Pose filtering
 
-- `is_front_facing()` uses 2D-symmetry of the 5 anchor landmarks
-  (eye/mouth distances to nose). Catches yaw cleanly, **does not
-  detect pitch** (head looking up/down). Pitch is rare in selfies;
-  if it ever matters, switch to MediaPipe's
-  `output_facial_transformation_matrixes=True` and decompose the 4×4.
-- The default threshold (`max_asymmetry=0.20`) tolerates ~25° of head
-  turn. A stricter `0.10` filters everything beyond ~15°.
-- The check runs on landmarks in the **original image space**, not on
-  aligned ones. Procrustes is a similarity transform and preserves
-  ratios, so either would yield the same answer — but pre-alignment
-  is one less branch.
+- `is_front_facing()` uses MediaPipe's `facial_transformation_matrixes`
+  (a 4×4 mapping from canonical face → camera). Column 2 of the
+  rotation 3×3 is the face's forward axis in camera coords; its z
+  component is `cos(angle to camera)`. Threshold against
+  `cos(max_head_tilt_deg)`.
+- An earlier version used 2D-symmetry of the 5 anchors (`max_asymmetry`).
+  It was structurally blind to profiles: MediaPipe Face Mesh fills
+  occluded landmarks from a 3D template, so the 2D points stay roughly
+  symmetric even at 80° yaw. Don't reintroduce that path.
+- MediaPipe sometimes returns `face_landmarks` but no
+  `facial_transformation_matrixes` — almost always for full-profile
+  shots where the pose solver fails. We treat `matrix is None` as
+  "not front-facing" so those still get filtered.
+- `make_landmarker()` must enable `output_facial_transformation_matrixes=True`
+  for the filter to work.
 
 ### FastAPI / Starlette / multipart
 
