@@ -168,6 +168,12 @@
       <input type="checkbox" id="overlay" checked />
       <label for="overlay">Burn the filename into each frame</label>
     </div>
+    <div class="control checkbox">
+      <input type="checkbox" id="frontFacingOnly" />
+      <label for="frontFacingOnly">Only include front-facing photos
+        <small style="color: var(--muted); font-weight: normal;">(skip turned heads — useful for big archives)</small>
+      </label>
+    </div>
   </div>
 
   <button class="primary" id="render" disabled>Render</button>
@@ -292,6 +298,7 @@ renderBtn.addEventListener("click", async () => {
   fd.append("frames_per_pair", $("fpp").value);
   fd.append("fps", $("fps").value);
   fd.append("overlay", $("overlay").checked ? "true" : "false");
+  fd.append("front_facing_only", $("frontFacingOnly").checked ? "true" : "false");
 
   let job_id;
   try {
@@ -362,6 +369,7 @@ function showResult(jobId, d) {
   const parts = [`${d.duration_s.toFixed(1)} s`];
   if (d.encoder) parts.push(d.encoder);
   parts.push(`${d.used} photos`);
+  if (d.pose_filtered) parts.push(`${d.pose_filtered} not front-facing`);
   if (d.skipped) parts.push(`${d.skipped} skipped`);
   resultMeta.textContent = parts.join(" · ");
   result.hidden = false;

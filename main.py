@@ -71,6 +71,7 @@ class RenderResult:
     total_frames: int
     used_files: list[Path]
     skipped_files: list[Path] = field(default_factory=list)
+    pose_filtered_files: list[Path] = field(default_factory=list)
     encoder: str = ""
 
     @property
@@ -141,6 +142,37 @@ def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
         return None
     lm = result.face_landmarks[0][:468]
     return np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
+
+
+def is_front_facing(landmarks: np.ndarray, max_asymmetry: float) -> bool:
+    """True if the head looks roughly at the camera (yaw filter).
+
+    A 2D-symmetry check on the five anchor points: the sum of nose-to-eye
+    plus nose-to-mouth-corner distances should be similar on the left and
+    right sides. Strong yaw collapses one side onto the nose, blowing the
+    asymmetry up. Pitch is harder to detect from 2D alone — for selfies
+    that's rarely the failure mode anyway, so we skip it here.
+
+    asymmetry := |left_d - right_d| / (left_d + right_d) ∈ [0, 1]
+        - ~0.00 perfectly facing camera
+        - ~0.10 mild head turn (~15°)
+        - ~0.20 noticeable turn (~25°)
+        - >0.40 profile-ish
+
+    Default threshold of 0.20 catches most "looking off-camera" cases while
+    keeping natural face asymmetry untouched.
+    """
+    nose = landmarks[1]
+    left_eye = landmarks[263]
+    right_eye = landmarks[33]
+    left_mouth = landmarks[291]
+    right_mouth = landmarks[61]
+    left_d = float(np.linalg.norm(left_eye - nose) + np.linalg.norm(left_mouth - nose))
+    right_d = float(np.linalg.norm(right_eye - nose) + np.linalg.norm(right_mouth - nose))
+    total = left_d + right_d
+    if total <= 1e-3:
+        return False
+    return abs(left_d - right_d) / total < max_asymmetry
 
 
 def canonical_template(canvas_w: int, canvas_h: int) -> np.ndarray:
@@ -428,6 +460,8 @@ def run_pipeline(
     overlay: bool = True,
     keep_aligned_dir: Path | None = None,
     encoder: str | None = None,
+    front_facing_only: bool = False,
+    max_asymmetry: float = 0.20,
     on_progress: ProgressCallback | None = None,
 ) -> RenderResult:
     """Run the full face-movie pipeline.
@@ -468,6 +502,7 @@ def run_pipeline(
     aligned_landmarks: list[np.ndarray] = []
     used_files: list[Path] = []
     skipped: list[Path] = []
+    pose_filtered: list[Path] = []
 
     if on_progress:
         on_progress("detect", 0, len(files))
@@ -482,6 +517,8 @@ def run_pipeline(
                 lm = detect_landmarks(img, landmarker)
                 if lm is None:
                     skipped.append(f)
+                elif front_facing_only and not is_front_facing(lm, max_asymmetry):
+                    pose_filtered.append(f)
                 else:
                     try:
                         aligned_img, aligned_lm = align_to_canvas(
@@ -498,10 +535,13 @@ def run_pipeline(
         landmarker.close()
 
     if len(aligned_images) < 2:
-        raise RuntimeError(
+        msg = (
             f"need at least 2 images with detectable faces; got {len(aligned_images)} "
             f"after skipping {len(skipped)}"
         )
+        if pose_filtered:
+            msg += f" and pose-filtering {len(pose_filtered)}"
+        raise RuntimeError(msg)
 
     if keep_aligned_dir:
         keep_aligned_dir = Path(keep_aligned_dir)
@@ -550,6 +590,7 @@ def run_pipeline(
         canvas_w=canvas_w, canvas_h=canvas_h,
         fps=fps, total_frames=total_frames,
         used_files=used_files, skipped_files=skipped,
+        pose_filtered_files=pose_filtered,
         encoder=encoder_name,
     )
 
@@ -607,6 +648,12 @@ def main() -> int:
     ap.add_argument("--encoder", default=None,
                     help="Force a specific ffmpeg encoder (e.g. libx264, h264_nvenc). "
                          "Default: auto-detect, prefer hardware.")
+    ap.add_argument("--front-facing-only", action="store_true",
+                    help="Skip photos where the head is turned away from the camera. "
+                         "Useful for cleaning up large archives.")
+    ap.add_argument("--max-asymmetry", default=0.20, type=float,
+                    help="Front-facing tolerance (0.0–1.0). Lower = stricter. "
+                         "Only used with --front-facing-only.")
     args = ap.parse_args()
 
     try:
@@ -617,6 +664,8 @@ def main() -> int:
             overlay=not args.no_overlay,
             keep_aligned_dir=args.output if args.keep_aligned else None,
             encoder=args.encoder,
+            front_facing_only=args.front_facing_only,
+            max_asymmetry=args.max_asymmetry,
             on_progress=_cli_progress(),
         )
     except (ValueError, RuntimeError) as e:
@@ -629,6 +678,13 @@ def main() -> int:
             print(f"    - {p.name}")
         if len(result.skipped_files) > 10:
             print(f"    ... and {len(result.skipped_files) - 10} more")
+
+    if result.pose_filtered_files:
+        print(f"  filtered {len(result.pose_filtered_files)} (not front-facing):")
+        for p in result.pose_filtered_files[:10]:
+            print(f"    - {p.name}")
+        if len(result.pose_filtered_files) > 10:
+            print(f"    ... and {len(result.pose_filtered_files) - 10} more")
 
     print(
         f"done: {result.output_path} "

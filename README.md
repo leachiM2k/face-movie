@@ -98,6 +98,12 @@ on the first run without supplying any photos of your own.
 | `--no-overlay` | off | disable the burned-in filename caption |
 | `--keep-aligned` | off | also dump aligned still frames (debug) |
 | `--encoder NAME` | auto | force a specific ffmpeg encoder (`libx264`, `h264_nvenc`, …) |
+| `--front-facing-only` | off | skip photos where the head is turned away from the camera |
+| `--max-asymmetry N` | `0.20` | front-facing tolerance — lower = stricter (only with `--front-facing-only`) |
+
+The web UI exposes a **"Only include front-facing photos"** checkbox for
+the same filter, useful when cleaning up a large archive that mixes
+selfies with off-camera shots.
 
 Environment variable `FACE_MOVIE_DELEGATE=cpu` forces MediaPipe onto the CPU
 path — useful if the GPU delegate aborts on your driver/SDK combination.

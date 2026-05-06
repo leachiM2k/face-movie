@@ -231,6 +231,20 @@ These are bugs / surprises that already cost a debug round. Read them.
   rare but possible. If you ever see triangles drop out of the mesh
   unexpectedly, that's the first place to look.
 
+### Pose filtering
+
+- `is_front_facing()` uses 2D-symmetry of the 5 anchor landmarks
+  (eye/mouth distances to nose). Catches yaw cleanly, **does not
+  detect pitch** (head looking up/down). Pitch is rare in selfies;
+  if it ever matters, switch to MediaPipe's
+  `output_facial_transformation_matrixes=True` and decompose the 4×4.
+- The default threshold (`max_asymmetry=0.20`) tolerates ~25° of head
+  turn. A stricter `0.10` filters everything beyond ~15°.
+- The check runs on landmarks in the **original image space**, not on
+  aligned ones. Procrustes is a similarity transform and preserves
+  ratios, so either would yield the same answer — but pre-alignment
+  is one less branch.
+
 ### FastAPI / Starlette / multipart
 
 - **`from fastapi import UploadFile` returns FastAPI's *subclass* of

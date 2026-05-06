@@ -57,6 +57,7 @@ class Job:
     encoder: str | None = None
     skipped: int = 0
     used: int = 0
+    pose_filtered: int = 0
     duration_s: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -93,6 +94,9 @@ async def start_render(request: Request):
         frames_per_pair = int(form.get("frames_per_pair", "6"))
         fps = int(form.get("fps", "30"))
         overlay = str(form.get("overlay", "true")).lower() in ("true", "1", "yes", "on")
+        front_facing_only = str(form.get("front_facing_only", "false")).lower() in (
+            "true", "1", "yes", "on",
+        )
     except (TypeError, ValueError) as e:
         raise HTTPException(400, f"invalid parameter: {e}") from e
 
@@ -136,13 +140,14 @@ async def start_render(request: Request):
     asyncio.get_running_loop().run_in_executor(
         None,
         _run_job_blocking,
-        job, scale, frames_per_pair, fps, overlay,
+        job, scale, frames_per_pair, fps, overlay, front_facing_only,
     )
     return {"job_id": job_id, "files": saved}
 
 
 def _run_job_blocking(
     job: Job, scale: float, frames_per_pair: int, fps: int, overlay: bool,
+    front_facing_only: bool,
 ) -> None:
     """Runs run_pipeline() on a worker thread. Mutates job under its lock."""
     def progress(stage: str, current: int, total: int) -> None:
@@ -161,6 +166,7 @@ def _run_job_blocking(
             frames_per_pair=frames_per_pair,
             fps=fps,
             overlay=overlay,
+            front_facing_only=front_facing_only,
             on_progress=progress,
         )
         with job.lock:
@@ -168,6 +174,7 @@ def _run_job_blocking(
             job.encoder = result.encoder
             job.used = len(result.used_files)
             job.skipped = len(result.skipped_files)
+            job.pose_filtered = len(result.pose_filtered_files)
             job.duration_s = result.duration_seconds
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
@@ -188,7 +195,7 @@ async def events(job_id: str):
         while True:
             with job.lock:
                 snap = (job.stage, job.current, job.total, job.error, job.encoder,
-                        job.used, job.skipped, job.duration_s)
+                        job.used, job.skipped, job.pose_filtered, job.duration_s)
             if snap != last:
                 payload = {
                     "stage": snap[0],
@@ -198,7 +205,8 @@ async def events(job_id: str):
                     "encoder": snap[4],
                     "used": snap[5],
                     "skipped": snap[6],
-                    "duration_s": snap[7],
+                    "pose_filtered": snap[7],
+                    "duration_s": snap[8],
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
                 last = snap
