@@ -84,18 +84,24 @@ def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
     return np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
 
 
-def canonical_template(canvas_size: int) -> np.ndarray:
+def canonical_template(canvas_w: int, canvas_h: int) -> np.ndarray:
     """Target positions (canvas coords) for the 5 anchor points.
 
-    Tuned so a typical portrait fills the canvas without cropping the chin.
+    Face is centered horizontally; eyes sit ~40% down, mouth ~58% down. The
+    inter-eye distance is sized to ~28% of the short edge so a typical portrait
+    fills the frame without cropping the chin in landscape, nor cropping the
+    sides in portrait.
     """
-    s = canvas_size
+    cx = canvas_w / 2
+    short = min(canvas_w, canvas_h)
+    eye_dx = 0.28 * short / 2
+    mouth_dx = 0.10 * short / 2
     return np.array([
-        (0.38 * s, 0.40 * s),  # right eye
-        (0.62 * s, 0.40 * s),  # left eye
-        (0.50 * s, 0.55 * s),  # nose tip
-        (0.41 * s, 0.72 * s),  # right mouth corner
-        (0.59 * s, 0.72 * s),  # left mouth corner
+        (cx - eye_dx,  0.40 * canvas_h),  # right eye
+        (cx + eye_dx,  0.40 * canvas_h),  # left eye
+        (cx,           0.50 * canvas_h),  # nose tip
+        (cx - mouth_dx, 0.58 * canvas_h), # right mouth corner
+        (cx + mouth_dx, 0.58 * canvas_h), # left mouth corner
     ], dtype=np.float32)
 
 
@@ -103,7 +109,8 @@ def align_to_canvas(
     image_bgr: np.ndarray,
     landmarks: np.ndarray,
     template: np.ndarray,
-    canvas_size: int,
+    canvas_w: int,
+    canvas_h: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Apply similarity transform so anchors match the template.
 
@@ -114,41 +121,44 @@ def align_to_canvas(
     if M is None:
         raise RuntimeError("could not estimate similarity transform")
     aligned = cv2.warpAffine(
-        image_bgr, M, (canvas_size, canvas_size),
-        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
+        image_bgr, M, (canvas_w, canvas_h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
     pts = np.hstack([landmarks, np.ones((len(landmarks), 1), dtype=np.float32)])
     aligned_lm = (pts @ M.T).astype(np.float32)
-    # MediaPipe occasionally puts landmarks (chin, ears, jaw) slightly outside
-    # the original image, and Procrustes can map them outside the canvas. Pixels
-    # outside the canvas don't exist in `aligned`, so clamping is correct — and
-    # it prevents triangle bounding rects from slicing past the dst array.
-    np.clip(aligned_lm, 0, canvas_size - 1, out=aligned_lm)
+    # Pixels outside the canvas don't exist in `aligned`; clamping is correct
+    # and prevents triangle bounding rects from slicing past the dst array.
+    aligned_lm[:, 0] = np.clip(aligned_lm[:, 0], 0, canvas_w - 1)
+    aligned_lm[:, 1] = np.clip(aligned_lm[:, 1], 0, canvas_h - 1)
     return aligned, aligned_lm
 
 
-def boundary_points(canvas_size: int) -> np.ndarray:
+def boundary_points(canvas_w: int, canvas_h: int) -> np.ndarray:
     """Pinned points on the canvas border so warps cover the whole frame."""
-    s = canvas_size - 1
-    coords = np.linspace(0, s, 4)
+    xs = np.linspace(0, canvas_w - 1, 4)
+    ys = np.linspace(0, canvas_h - 1, 4)
     pts = []
-    for x in coords:
+    for x in xs:
         pts.append((x, 0))
-        pts.append((x, s))
-    for y in coords[1:-1]:
+        pts.append((x, canvas_h - 1))
+    for y in ys[1:-1]:
         pts.append((0, y))
-        pts.append((s, y))
+        pts.append((canvas_w - 1, y))
     return np.array(pts, dtype=np.float32)
 
 
-def delaunay_triangles(points: np.ndarray, canvas_size: int) -> list[tuple[int, int, int]]:
+def delaunay_triangles(
+    points: np.ndarray, canvas_w: int, canvas_h: int,
+) -> list[tuple[int, int, int]]:
     """Compute Delaunay triangulation on `points`. Returns triangle index triples."""
-    rect = (0, 0, canvas_size, canvas_size)
+    rect = (0, 0, canvas_w, canvas_h)
     subdiv = cv2.Subdiv2D(rect)
     for p in points:
         subdiv.insert((float(p[0]), float(p[1])))
     raw = subdiv.getTriangleList()
 
+    # Map triangle vertices back to indices in `points`.
     lookup = {(round(float(p[0]), 1), round(float(p[1]), 1)): i for i, p in enumerate(points)}
     triangles: list[tuple[int, int, int]] = []
     for t in raw:
@@ -232,16 +242,25 @@ def pick_encoder() -> list[str]:
 def encode_video(
     frames: Iterable[np.ndarray],
     output_path: Path,
-    canvas_size: int,
+    canvas_w: int,
+    canvas_h: int,
     fps: int,
 ) -> None:
     """Pipe BGR frames into ffmpeg as raw video and encode to H.264."""
+    # H.264 requires even dimensions for yuv420p — round up via crop (cheap).
+    pad_w = canvas_w + (canvas_w & 1)
+    pad_h = canvas_h + (canvas_h & 1)
+    vf_args = []
+    if pad_w != canvas_w or pad_h != canvas_h:
+        vf_args = ["-vf", f"pad={pad_w}:{pad_h}"]
+
     cmd = [
         "ffmpeg", "-y", "-loglevel", "warning",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{canvas_size}x{canvas_size}",
+        "-s", f"{canvas_w}x{canvas_h}",
         "-r", str(fps),
         "-i", "-",
+        *vf_args,
         *pick_encoder(),
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
@@ -259,17 +278,34 @@ def encode_video(
         raise RuntimeError(f"ffmpeg exited with status {rc}")
 
 
+def draw_overlay(frame: np.ndarray, text: str) -> np.ndarray:
+    """Draw a filename caption in the bottom-left corner (matches the legacy tool)."""
+    out = frame.copy()
+    h = out.shape[0]
+    pos = (10, h - 12)
+    # Black outline + white fill for legibility on any background.
+    cv2.putText(out, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(out, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Align faces and morph between them.")
     ap.add_argument("--input", default="payload/input", type=Path)
     ap.add_argument("--output", default="payload/output", type=Path,
                     help="Directory for aligned still frames (only used with --keep-aligned).")
     ap.add_argument("--video", default="payload/out_morphed.mp4", type=Path)
-    ap.add_argument("--size", default=720, type=int,
-                    help="Output canvas size (square, in pixels). Bigger = sharper but slower.")
+    ap.add_argument("--width", type=int, default=None,
+                    help="Output width. Default: auto-detect from first input image.")
+    ap.add_argument("--height", type=int, default=None,
+                    help="Output height. Default: auto-detect from first input image.")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="Proportional scale on the auto-detected canvas (0.5 = half).")
     ap.add_argument("--frames-per-pair", default=6, type=int,
                     help="Morph frames generated between each pair of photos.")
     ap.add_argument("--fps", default=30, type=int)
+    ap.add_argument("--no-overlay", action="store_true",
+                    help="Disable the filename caption burned into each frame.")
     ap.add_argument("--keep-aligned", action="store_true",
                     help="Also dump aligned still frames into --output.")
     args = ap.parse_args()
@@ -282,8 +318,25 @@ def main() -> int:
         print(f"need at least 2 images in {args.input}", file=sys.stderr)
         return 1
 
-    print(f"[1/4] detecting landmarks in {len(files)} images")
-    template = canonical_template(args.size)
+    # Determine canvas dimensions — explicit flags win, else first valid image.
+    if args.width and args.height:
+        canvas_w, canvas_h = args.width, args.height
+    else:
+        probe = None
+        for f in files:
+            probe = cv2.imread(str(f))
+            if probe is not None:
+                break
+        if probe is None:
+            print(f"could not read any image in {args.input}", file=sys.stderr)
+            return 1
+        h0, w0 = probe.shape[:2]
+        canvas_w = args.width or int(round(w0 * args.scale))
+        canvas_h = args.height or int(round(h0 * args.scale))
+
+    print(f"[1/4] detecting landmarks in {len(files)} images "
+          f"(canvas {canvas_w}x{canvas_h})")
+    template = canonical_template(canvas_w, canvas_h)
     aligned_images: list[np.ndarray] = []
     aligned_landmarks: list[np.ndarray] = []
     used_files: list[Path] = []
@@ -301,7 +354,9 @@ def main() -> int:
                 skipped.append(f)
                 continue
             try:
-                aligned_img, aligned_lm = align_to_canvas(img, lm, template, args.size)
+                aligned_img, aligned_lm = align_to_canvas(
+                    img, lm, template, canvas_w, canvas_h,
+                )
             except RuntimeError:
                 skipped.append(f)
                 continue
@@ -328,10 +383,10 @@ def main() -> int:
             cv2.imwrite(str(args.output / f"c_{f.name}"), img)
 
     print("[2/4] computing template + Delaunay triangulation")
-    bnd = boundary_points(args.size)
+    bnd = boundary_points(canvas_w, canvas_h)
     full_landmarks = [np.vstack([lm, bnd]) for lm in aligned_landmarks]
     mean_pts = np.mean(np.stack(full_landmarks), axis=0)
-    triangles = delaunay_triangles(mean_pts, args.size)
+    triangles = delaunay_triangles(mean_pts, canvas_w, canvas_h)
     print(f"  {len(triangles)} triangles over {len(mean_pts)} vertices")
 
     n_pairs = len(aligned_images) - 1
@@ -341,17 +396,25 @@ def main() -> int:
         pbar = tqdm(total=n_pairs)
         for i in range(n_pairs):
             include_endpoint = (i == n_pairs - 1)
-            yield from morph_pair(
+            label_a = used_files[i].stem
+            label_b = used_files[i + 1].stem
+            for j, frame in enumerate(morph_pair(
                 aligned_images[i], aligned_images[i + 1],
                 full_landmarks[i], full_landmarks[i + 1],
                 triangles, args.frames_per_pair, include_endpoint,
-            )
+            )):
+                if not args.no_overlay:
+                    # Show A's label until t crosses 0.5, then B's. With
+                    # frames_per_pair=N, t = j/N (or j/(N-1) on last pair).
+                    t = j / args.frames_per_pair
+                    frame = draw_overlay(frame, label_b if t >= 0.5 else label_a)
+                yield frame
             pbar.update(1)
         pbar.close()
 
     print(f"[4/4] encoding to {args.video}")
     args.video.parent.mkdir(parents=True, exist_ok=True)
-    encode_video(all_frames(), args.video, args.size, args.fps)
+    encode_video(all_frames(), args.video, canvas_w, canvas_h, args.fps)
 
     total_frames = n_pairs * args.frames_per_pair + 1
     print(f"done: {args.video} ({total_frames} frames @ {args.fps} fps "
