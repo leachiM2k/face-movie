@@ -2,3 +2,8 @@ mediapipe>=0.10.18
 opencv-python>=4.10.0
 numpy>=1.26,<3
 tqdm>=4.66
+
+# Web UI (only loaded when running `face-movie web`).
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.18
