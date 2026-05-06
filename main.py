@@ -59,6 +59,15 @@ ANCHOR_INDICES = (
     291,  # left mouth corner
 )
 
+# MediaPipe FACEMESH_FACE_OVAL — the 36 indices that trace the face contour
+# (forehead → temple → cheek → jaw → chin → up the other side). Used to
+# build the "halo" ring of extra anchors just outside the face.
+FACE_OVAL_INDICES = (
+    10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
+    397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
+    172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
+)
+
 ProgressCallback = Callable[[str, int, int], None]
 
 
@@ -71,6 +80,7 @@ class RenderResult:
     total_frames: int
     used_files: list[Path]
     skipped_files: list[Path] = field(default_factory=list)
+    pose_filtered_files: list[Path] = field(default_factory=list)
     encoder: str = ""
 
     @property
@@ -118,6 +128,9 @@ def make_landmarker() -> mp_vision.FaceLandmarker:
                 running_mode=mp_vision.RunningMode.IMAGE,
                 num_faces=1,
                 min_face_detection_confidence=0.5,
+                # Returns the 4×4 transform from the canonical face model to
+                # camera space; we use it for an honest head-pose filter.
+                output_facial_transformation_matrixes=True,
             )
             return mp_vision.FaceLandmarker.create_from_options(options)
         except Exception:
@@ -125,13 +138,19 @@ def make_landmarker() -> mp_vision.FaceLandmarker:
     raise RuntimeError("could not initialize MediaPipe FaceLandmarker")
 
 
-def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
-    """Return Nx2 landmark pixel coordinates, or None if no face was found.
+def detect_landmarks(
+    image_bgr: np.ndarray, landmarker,
+) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """Return ((Nx2 landmarks), 4x4 pose matrix or None), or None if no face.
 
     The FaceLandmarker returns 478 points (468 face mesh + 10 iris). We keep
     the first 468 — the iris points jitter when eyes blink and aren't useful
     for morph triangulation. RGBA is used (not RGB) so the Metal/OpenGL GPU
     delegate path doesn't abort on the ImageFrame conversion.
+
+    The pose matrix is `None` when MediaPipe found a face but couldn't fit a
+    transform — typically extreme profile shots where the 3D solver fails.
+    Treated as "not front-facing" by the filter.
     """
     h, w = image_bgr.shape[:2]
     rgba = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGBA)
@@ -140,7 +159,38 @@ def detect_landmarks(image_bgr: np.ndarray, landmarker) -> np.ndarray | None:
     if not result.face_landmarks:
         return None
     lm = result.face_landmarks[0][:468]
-    return np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
+    coords = np.array([(p.x * w, p.y * h) for p in lm], dtype=np.float32)
+    matrix = None
+    if result.facial_transformation_matrixes:
+        matrix = np.array(result.facial_transformation_matrixes[0], dtype=np.float32)
+    return coords, matrix
+
+
+def is_front_facing(matrix: np.ndarray | None, max_head_tilt_deg: float) -> bool:
+    """True if the head is roughly facing the camera, by 3D pose.
+
+    MediaPipe's facial transformation matrix maps the canonical face model
+    into camera space. Its rotation 3×3 carries the head pose; column 2 is
+    the face's forward axis (out of the nose). Its z-component equals
+    cos(angle between forward and the camera optical axis) — exactly what
+    we need.
+
+    Threshold tuning:
+        max_head_tilt_deg = 15  → cos ≈ 0.966   strict frontal
+        max_head_tilt_deg = 20  → cos ≈ 0.940   default, ~all clean selfies pass
+        max_head_tilt_deg = 30  → cos ≈ 0.866   loose, lets through ~30° turns
+
+    A `None` matrix (face detected but pose solver failed) counts as not
+    front-facing — that case shows up almost exclusively for full profiles.
+
+    The 2D-symmetry filter this replaces missed real profiles entirely:
+    MediaPipe Face Mesh interpolates occluded landmarks from a 3D template,
+    so 2D symmetry stays high even when the head is fully turned.
+    """
+    if matrix is None:
+        return False
+    forward_z = float(matrix[2, 2])
+    return forward_z >= float(np.cos(np.radians(max_head_tilt_deg)))
 
 
 def canonical_template(canvas_w: int, canvas_h: int) -> np.ndarray:
@@ -203,6 +253,39 @@ def boundary_points(canvas_w: int, canvas_h: int) -> np.ndarray:
         pts.append((0, y))
         pts.append((canvas_w - 1, y))
     return np.array(pts, dtype=np.float32)
+
+
+def halo_points(
+    landmarks: np.ndarray,
+    factor: float,
+    canvas_w: int,
+    canvas_h: int,
+) -> np.ndarray:
+    """Extrapolate FACEMESH_FACE_OVAL points outward from the face center.
+
+    The face mesh densely covers the face surface but stops at the oval.
+    Between the oval and the canvas border, the triangulation has only the
+    sparse boundary points, so the few large triangles spanning that gap
+    pull on the face-edge anchors as the face shape changes — visible as
+    a "rubbery edge" in the morph.
+
+    For each oval landmark P we add an extra anchor at:
+        center + (P - center) * factor
+
+    A factor of 1 disables the ring (anchors coincide with the oval, no
+    benefit); 1.25 is a gentle outward push that adds dedicated anchors
+    in the immediate ring around the face. Points are clipped to the
+    canvas because the extrapolation can push them off-image when the
+    face fills the frame.
+    """
+    if factor <= 1.0:
+        return np.empty((0, 2), dtype=np.float32)
+    oval = landmarks[list(FACE_OVAL_INDICES)]
+    center = oval.mean(axis=0)
+    halo = (center + (oval - center) * factor).astype(np.float32)
+    halo[:, 0] = np.clip(halo[:, 0], 0, canvas_w - 1)
+    halo[:, 1] = np.clip(halo[:, 1], 0, canvas_h - 1)
+    return halo
 
 
 def delaunay_triangles(
@@ -428,6 +511,9 @@ def run_pipeline(
     overlay: bool = True,
     keep_aligned_dir: Path | None = None,
     encoder: str | None = None,
+    front_facing_only: bool = False,
+    max_head_tilt_deg: float = 20.0,
+    halo_factor: float = 1.25,
     on_progress: ProgressCallback | None = None,
 ) -> RenderResult:
     """Run the full face-movie pipeline.
@@ -468,6 +554,7 @@ def run_pipeline(
     aligned_landmarks: list[np.ndarray] = []
     used_files: list[Path] = []
     skipped: list[Path] = []
+    pose_filtered: list[Path] = []
 
     if on_progress:
         on_progress("detect", 0, len(files))
@@ -479,29 +566,36 @@ def run_pipeline(
             if img is None:
                 skipped.append(f)
             else:
-                lm = detect_landmarks(img, landmarker)
-                if lm is None:
+                detected = detect_landmarks(img, landmarker)
+                if detected is None:
                     skipped.append(f)
                 else:
-                    try:
-                        aligned_img, aligned_lm = align_to_canvas(
-                            img, lm, template, canvas_w, canvas_h,
-                        )
-                        aligned_images.append(aligned_img)
-                        aligned_landmarks.append(aligned_lm)
-                        used_files.append(f)
-                    except RuntimeError:
-                        skipped.append(f)
+                    lm, matrix = detected
+                    if front_facing_only and not is_front_facing(matrix, max_head_tilt_deg):
+                        pose_filtered.append(f)
+                    else:
+                        try:
+                            aligned_img, aligned_lm = align_to_canvas(
+                                img, lm, template, canvas_w, canvas_h,
+                            )
+                            aligned_images.append(aligned_img)
+                            aligned_landmarks.append(aligned_lm)
+                            used_files.append(f)
+                        except RuntimeError:
+                            skipped.append(f)
             if on_progress:
                 on_progress("detect", i, len(files))
     finally:
         landmarker.close()
 
     if len(aligned_images) < 2:
-        raise RuntimeError(
+        msg = (
             f"need at least 2 images with detectable faces; got {len(aligned_images)} "
             f"after skipping {len(skipped)}"
         )
+        if pose_filtered:
+            msg += f" and pose-filtering {len(pose_filtered)}"
+        raise RuntimeError(msg)
 
     if keep_aligned_dir:
         keep_aligned_dir = Path(keep_aligned_dir)
@@ -510,7 +604,14 @@ def run_pipeline(
             cv2.imwrite(str(keep_aligned_dir / f"c_{f.name}"), img)
 
     bnd = boundary_points(canvas_w, canvas_h)
-    full_landmarks = [np.vstack([lm, bnd]) for lm in aligned_landmarks]
+    full_landmarks = [
+        np.vstack([
+            lm,
+            halo_points(lm, halo_factor, canvas_w, canvas_h),
+            bnd,
+        ])
+        for lm in aligned_landmarks
+    ]
     mean_pts = np.mean(np.stack(full_landmarks), axis=0)
     triangles = delaunay_triangles(mean_pts, canvas_w, canvas_h)
     if on_progress:
@@ -550,6 +651,7 @@ def run_pipeline(
         canvas_w=canvas_w, canvas_h=canvas_h,
         fps=fps, total_frames=total_frames,
         used_files=used_files, skipped_files=skipped,
+        pose_filtered_files=pose_filtered,
         encoder=encoder_name,
     )
 
@@ -607,6 +709,17 @@ def main() -> int:
     ap.add_argument("--encoder", default=None,
                     help="Force a specific ffmpeg encoder (e.g. libx264, h264_nvenc). "
                          "Default: auto-detect, prefer hardware.")
+    ap.add_argument("--front-facing-only", action="store_true",
+                    help="Skip photos where the head is turned away from the camera. "
+                         "Useful for cleaning up large archives.")
+    ap.add_argument("--max-head-tilt-deg", default=20.0, type=float,
+                    help="Front-facing tolerance in degrees (any axis). "
+                         "20°≈default, 15°=strict, 30°=loose. "
+                         "Only used with --front-facing-only.")
+    ap.add_argument("--halo-factor", default=1.25, type=float,
+                    help="Outward extrapolation of FACEMESH_FACE_OVAL anchors "
+                         "for smoother face-edge morphing. 1.0 disables; "
+                         "1.25 is the default; 1.5+ gets aggressive.")
     args = ap.parse_args()
 
     try:
@@ -617,6 +730,9 @@ def main() -> int:
             overlay=not args.no_overlay,
             keep_aligned_dir=args.output if args.keep_aligned else None,
             encoder=args.encoder,
+            front_facing_only=args.front_facing_only,
+            max_head_tilt_deg=args.max_head_tilt_deg,
+            halo_factor=args.halo_factor,
             on_progress=_cli_progress(),
         )
     except (ValueError, RuntimeError) as e:
@@ -629,6 +745,13 @@ def main() -> int:
             print(f"    - {p.name}")
         if len(result.skipped_files) > 10:
             print(f"    ... and {len(result.skipped_files) - 10} more")
+
+    if result.pose_filtered_files:
+        print(f"  filtered {len(result.pose_filtered_files)} (not front-facing):")
+        for p in result.pose_filtered_files[:10]:
+            print(f"    - {p.name}")
+        if len(result.pose_filtered_files) > 10:
+            print(f"    ... and {len(result.pose_filtered_files) - 10} more")
 
     print(
         f"done: {result.output_path} "
