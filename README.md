@@ -1,3 +1,5 @@
+<img src="docs/logo.png" align="left" width="84" height="84" alt="Face-Movie logo" />
+
 # Face-Movie
 
 > **Take a selfie every morning. Years later, watch yourself grow up.**
